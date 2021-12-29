@@ -303,7 +303,7 @@ construct_runtime!(
 		TransactionPayment: pallet_transaction_payment,
 		Sudo: pallet_sudo,
 		// Include the custom logic from the pallet-template in the runtime.
-		ClueNFTs: pallet_cluenfts,
+		ClueNfts: pallet_cluenfts,
 	}
 );
 

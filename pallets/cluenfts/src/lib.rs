@@ -25,18 +25,18 @@ pub mod pallet {
     #[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo)]
     #[scale_info(skip_type_params(T))]
     pub struct ClueNFT<T: Config> {
-        pub dna: [u8; 16],
+        pub asset_url: [u8; 16],
         pub price: Option<BalanceOf<T>>,
-        pub gender: Gender,
+        pub asset_type: AssetType,
         pub owner: AccountOf<T>,
     }
 
     #[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo)]
     #[scale_info(skip_type_params(T))]
     #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-    pub enum Gender {
-        Male,
-        Female,
+    pub enum AssetType {
+        Video,
+        Picture,
     }
 
     #[pallet::pallet]
@@ -49,13 +49,10 @@ pub mod pallet {
         /// Because this pallet emits events, it depends on the runtime's definition of an event.
         type Event: From<Event<Self>> + IsType<<Self as frame_system::Config>::Event>;
 
-        /// The Currency handler for the NFTs pallet.
         type Currency: Currency<Self::AccountId>;
 
-        // ACTION #5: Specify the type for Randomness we want to specify for runtime.
         type NFTRandomness: Randomness<Self::Hash, Self::BlockNumber>;
 
-        // ACTION #9: Add MaxNFTsOwned constant
         #[pallet::constant]
         type MaxNFTOwned: Get<u32>;
     }
@@ -102,7 +99,6 @@ pub mod pallet {
     #[pallet::getter(fn nft_cnt)]
     pub(super) type NFTCnt<T: Config> = StorageValue<_, u64, ValueQuery>;
 
-    // ACTION #7: Remaining storage items.
     #[pallet::storage]
     #[pallet::getter(fn nft)]
     pub(super) type ClueNFTs<T: Config> = StorageMap<
@@ -123,6 +119,36 @@ pub mod pallet {
         ValueQuery,
     >;
 
+    #[pallet::genesis_config]
+    pub struct GenesisConfig<T: Config> {
+        pub clue_nfts: Vec<(T::AccountId, [u8; 16], AssetType)>,
+    }
+
+    #[cfg(feature = "std")]
+    impl<T: Config> Default for GenesisConfig<T> {
+        fn default() -> GenesisConfig<T> {
+            GenesisConfig { clue_nfts: vec![] }
+        }
+    }
+
+    #[pallet::genesis_build]
+    impl<T: Config> GenesisBuild<T> for GenesisConfig<T> {
+        fn build(&self) {
+            // When building a nft from genesis config, we require the dna and gender to be supplied.
+            for (acct, asset_url, asset_type) in &self.clue_nfts {
+                let _ = <Pallet<T>>::mint(acct, asset_url.clone(), Some(asset_type.clone()));
+            }
+        }
+    }
+
+    #[pallet::hooks]
+    impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {}
+
+    // Dispatchable functions allows users to interact with the pallet and invoke state changes.
+    // These functions materialize as "extrinsics", which are often compared to transactions.
+    // Dispatchable functions must be annotated with a weight and must return a DispatchResult.
+
+
 
 
     #[pallet::call]
@@ -131,9 +157,9 @@ pub mod pallet {
         ///
         /// The actual nft creation is done in the `mint()` function.
         #[pallet::weight(100)]
-        pub fn create_nft(origin: OriginFor<T>) -> DispatchResult {
+        pub fn create_nft(origin: OriginFor<T>, asset_url: [u8; 16], asset_type: AssetType) -> DispatchResult {
             let sender = ensure_signed(origin)?;
-            let nft_id = Self::mint(&sender, None, None)?;
+            let nft_id = Self::mint(&sender, asset_url, Some(asset_type.clone()))?;
             // Logging to the console
             log::info!("A NFT is born with ID: {:?}.", nft_id);
 
@@ -142,13 +168,105 @@ pub mod pallet {
             Ok(())
         }
 
-        // TODO Part IV: set_price
+        #[pallet::weight(100)]
+        pub fn set_price(
+            origin: OriginFor<T>,
+            nft_id: T::Hash,
+            new_price: Option<BalanceOf<T>>
+        ) -> DispatchResult {
+            let sender = ensure_signed(origin)?;
 
-        // TODO Part IV: transfer
+            ensure!(Self::is_nft_owner(&nft_id, &sender)?, <Error<T>>::NotNFTOwner);
 
-        // TODO Part IV: buy_kitty
+            let mut nft = Self::nft(&nft_id).ok_or(<Error<T>>::NFTNotExist)?;
 
-        // TODO Part IV: breed_kitty
+            nft.price = new_price.clone();
+            <ClueNFTs<T>>::insert(&nft_id, nft);
+
+            Self::deposit_event(Event::PriceSet(sender, nft_id, new_price));
+
+            Ok(())
+        }
+
+        #[pallet::weight(100)]
+        pub fn transfer(
+            origin: OriginFor<T>,
+            to: T::AccountId,
+            nft_id: T::Hash,
+        ) -> DispatchResult {
+            let from = ensure_signed(origin)?;
+
+            ensure!(Self::is_nft_owner(&nft_id, &from)?, <Error<T>>::NotNFTOwner);
+
+            ensure!(from != to, <Error<T>>::TransferToSelf);
+
+            let to_owned = <NFTOwned<T>>::get(&to);
+            ensure!((to_owned.len() as u32) < T::MaxNFTOwned::get(), <Error<T>>::ExceedMaxNFTOwned);
+
+            Self::transfer_nft_to(&nft_id, &to)?;
+
+            Self::deposit_event(Event::Transferred(from, to, nft_id));
+
+            Ok(())
+        }
+
+
+        #[transactional]
+        #[pallet::weight(100)]
+        pub fn buy_nft(
+            origin: OriginFor<T>,
+            nft_id: T::Hash,
+            bid_price: BalanceOf<T>
+        ) -> DispatchResult {
+            let buyer = ensure_signed(origin)?;
+
+            let nft = Self::nft(&nft_id).ok_or(<Error<T>>::NFTNotExist)?;
+            ensure!(nft.owner != buyer, <Error<T>>::BuyerIsNFTOwner);
+
+            if let Some(ask_price) = nft.price {
+                ensure!(ask_price <= bid_price, <Error<T>>::NFTBidPriceTooLow);
+            } else {
+                Err(<Error<T>>::NFTNotForSale)?;
+            }
+
+            ensure!(T::Currency::free_balance(&buyer) >= bid_price, <Error<T>>::NotEnoughBalance);
+
+            let to_owned = <NFTOwned<T>>::get(&buyer);
+            ensure!((to_owned.len() as u32) < T::MaxNFTOwned::get(), <Error<T>>::ExceedMaxNFTOwned);
+
+            let to_owned = <NFTOwned<T>>::get(&buyer);
+            ensure!((to_owned.len() as u32) < T::MaxNFTOwned::get(), <Error<T>>::ExceedMaxNFTOwned);
+
+            let seller = nft.owner.clone();
+
+            T::Currency::transfer(&buyer, &seller, bid_price, ExistenceRequirement::KeepAlive)?;
+
+            Self::transfer_nft_to(&nft_id, &buyer)?;
+
+            Self::deposit_event(Event::Bought(buyer, seller, nft_id, bid_price));
+
+
+            Ok(())
+        }
+
+        #[pallet::weight(100)]
+        pub fn breed_nft(
+            origin: OriginFor<T>,
+            parent1: T::Hash,
+            parent2: T::Hash,
+            asset_url: [u8; 16],
+            asset_type: AssetType,
+        ) -> DispatchResult {
+            let sender = ensure_signed(origin)?;
+
+            // Check: Verify `sender` owns both nfts (and both nfts exist).
+            ensure!(Self::is_nft_owner(&parent1, &sender)?, <Error<T>>::NotNFTOwner);
+            ensure!(Self::is_nft_owner(&parent2, &sender)?, <Error<T>>::NotNFTOwner);
+
+            Self::mint(&sender, asset_url, Some(asset_type.clone()))?;
+
+            Ok(())
+        }
     }
 
     //** Our helper functions.**//
@@ -156,48 +274,47 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
 
         // ACTION #4: helper function for NFT struct
-        fn gen_gender() -> Gender {
-            let random = T::NFTRandomness::random(&b"gender"[..]).0;
-            match random.as_ref()[0] % 2 {
-                0 => Gender::Male,
-                _ => Gender::Female,
-            }
-        }
+        // fn gen_gender() -> Gender {
+        //     let random = T::NFTRandomness::random(&b"gender"[..]).0;
+        //     match random.as_ref()[0] % 2 {
+        //         0 => Gender::Male,
+        //         _ => Gender::Female,
+        //     }
+        // }
 
-        // TODO Part III: helper functions for dispatchable functions
 
-        fn gen_dna() -> [u8; 16] {
-            let payload = (
-                T::NFTRandomness::random(&b"dna"[..]).0,
-                <frame_system::Pallet<T>>::block_number(),
-            );
-            payload.using_encoded(blake2_128)
-
-        }
+        // fn gen_dna() -> [u8; 16] {
+        //     let payload = (
+        //         T::NFTRandomness::random(&b"dna"[..]).0,
+        //         <frame_system::Pallet<T>>::block_number(),
+        //     );
+        //     payload.using_encoded(blake2_128)
+        //
+        // }
 
         // Create new DNA with existing DNA
-        pub fn breed_dna(parent1: &T::Hash, parent2: &T::Hash) -> Result<[u8; 16], Error<T>> {
-            let dna1 = Self::nft(parent1).ok_or(<Error<T>>::NFTNotExist)?.dna;
-            let dna2 = Self::nft(parent2).ok_or(<Error<T>>::NFTNotExist)?.dna;
-
-            let mut new_dna = Self::gen_dna();
-            for i in 0..new_dna.len() {
-                new_dna[i] = (new_dna[i] & dna1[i]) | (!new_dna[i] & dna2[i]);
-            }
-            Ok(new_dna)
-        }
+        // pub fn breed_dna(parent1: &T::Hash, parent2: &T::Hash) -> Result<[u8; 16], Error<T>> {
+        //     let dna1 = Self::nft(parent1).ok_or(<Error<T>>::NFTNotExist)?.dna;
+        //     let dna2 = Self::nft(parent2).ok_or(<Error<T>>::NFTNotExist)?.dna;
+        //
+        //     let mut new_dna = Self::gen_dna();
+        //     for i in 0..new_dna.len() {
+        //         new_dna[i] = (new_dna[i] & dna1[i]) | (!new_dna[i] & dna2[i]);
+        //     }
+        //     Ok(new_dna)
+        // }
 
         // Helper to mint a NFT.
         pub fn mint(
             owner: &T::AccountId,
-            dna: Option<[u8; 16]>,
-            gender: Option<Gender>,
+            asset_url: [u8; 16],
+            asset_type: Option<AssetType>,
         ) -> Result<T::Hash, Error<T>> {
             let nft = ClueNFT::<T> {
-                dna: dna.unwrap_or_else(Self::gen_dna),
+                asset_url: asset_url.clone(),
                 price: None,
-                gender: gender.unwrap_or_else(Self::gen_gender),
                 owner: owner.clone(),
+                asset_type: asset_type.unwrap(),
             };
 
             let nft_id = T::Hashing::hash_of(&nft);
@@ -224,8 +341,34 @@ pub mod pallet {
             }
         }
 
-        // TODO Part III: mint
+        #[transactional]
+        pub fn transfer_nft_to(
+            nft_id: &T::Hash,
+            to: &T::AccountId,
+        ) -> Result<(), Error<T>> {
+            let mut nft = Self::nft(&nft_id).ok_or(<Error<T>>::NFTNotExist)?;
 
-        // TODO Part IV: transfer_kitty_to
+            let prev_owner = nft.owner.clone();
+
+            <NFTOwned<T>>::try_mutate(&prev_owner, |owned| {
+                if let Some(ind) = owned.iter().position(|&id| id == *nft_id) {
+                    owned.swap_remove(ind);
+                    return Ok(());
+                }
+                Err(())
+            }).map_err(|_| <Error<T>>::NFTNotExist)?;
+
+            nft.owner = to.clone();
+            // by the current owner.
+            nft.price = None;
+
+            <ClueNFTs<T>>::insert(nft_id, nft);
+
+            <NFTOwned<T>>::try_mutate(to, |vec| {
+                vec.try_push(*nft_id)
+            }).map_err(|_| <Error<T>>::ExceedMaxNFTOwned)?;
+
+            Ok(())
+        }
     }
 }
